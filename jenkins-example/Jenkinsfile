@@ -1,0 +1,129 @@
+def projectName = 'placeholder-name'
+def projectVersion = '0.0.0.0'
+def projectRelease = '1'
+
+def currentNamespace = env.JOB_NAME.replaceAll('/.*','')
+def testNamespace = currentNamespace.replace("ci-cd", "test")
+def devNamespace = currentNamespace.replace("ci-cd", "dev")
+
+pipeline {
+    // Use Jenkins CPP slave
+    // Jenkins will dynamically provision this as OpenShift Pod
+    // All the stages and steps of this Pipeline will be executed on this Pod
+    // After Pipeline completes the Pod is killed so every run will have clean
+    // workspace
+    agent {
+        label 'jenkins-slave-cpp'
+    }
+ 
+    triggers {
+        upstream(
+            upstreamProjects: "other-pipeline-1,other-pipeline-2",
+            threshold: hudson.model.Result.SUCCESS
+        )
+    }
+ 
+    // Pipeline Stages start here
+    stages {
+ 
+        // Clone git repo
+        stage('Clone'){
+            steps {
+                git branch: 'master', credentialsId: 'your-credentials', url: 'git@gitlab.com:some-group/some-repo.git'
+                script {
+                        projectName = "project-name"
+                        projectVersion = "compute-project-version-here"
+                        projectRelease = "compute-project-release-here"
+                }
+            }
+        }
+        
+        // Install Dependencies from Nexus
+        stage('Install Dependencies'){
+            steps {
+                script {
+                    for (component in ["dependency-1", "dependency-2", "dependency-3"]) 
+                    {
+                        version=sh(returnStdout: true, script: "curl http://nexus:8081/repository/my-library-repository/${component}-latest -u admin:admin123").trim()
+                        println version
+                        sh "wget http://nexus:8081/repository/my-library-repository/${version}.tar.gz --http-user admin --http-password admin123 -q"
+                        sh "tar -zxvf ${version}.tar.gz > /dev/null"
+                        sh "rm -f ${version}.tar.gz;"
+                    }
+                }
+            }
+        }
+       
+        // Run build  
+        stage('Build'){
+            steps {
+                sh """
+                    export CPLUS_INCLUDE_PATH=\$(pwd)/libraries/usr/include/
+                    pwd
+                    cmake . -DLIB_LOCATION=\$(pwd)/libraries/ -DLIB_SUFFIX=64 -DCMAKE_INSTALL_PREFIX:PATH=/usr -DCMAKE_BUILD_TYPE=RELWITHDEBINFO
+                    make -j\$(nproc) install DESTDIR=/tmp/libraries
+                """
+            }
+        }
+       
+        // Run test  
+        stage('Test'){
+            steps {
+                sh "make check -j\$(nproc) > Build-${env.BUILD_ID}-Unit-Test-Output.txt"
+                archiveArtifacts "Build-${env.BUILD_ID}-Unit-Test-Output.txt"
+            }
+        }
+        
+        // SonarQube
+        stage('Quality Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh "/opt/sonar-scanner/bin/sonar-scanner -Dsonar.projectVersion=${projectVersion}.${BUILD_ID}"
+                }
+            }
+        }
+       
+        // Package binary 
+        stage('Package'){
+            steps {
+                sh """
+                    tar -C /tmp/ -zcvf ${projectName}.${projectVersion}.${projectRelease}.tar.gz libraries/
+                """
+            }
+        }
+       
+        // Push the tarball to our Nexus Repo
+        stage('Publish'){
+            steps{
+                sh """
+                    curl --upload-file ${projectName}.${projectVersion}.${projectRelease}.tar.gz  -u \"admin:admin123\" http://nexus:8081/repository/some-blobs/
+                    echo ${projectName}.${projectVersion}.${projectRelease} > ${projectName}-latest
+                    curl --upload-file ${projectName}-latest -u \"admin:admin123\" http://nexus:8081/repository/some-blobs/
+                """
+            }
+        }
+
+        stage('Build Runtime Image'){
+            steps{
+                openshiftBuild bldCfg: 'my-openshift-buildconfig-name', showBuildLogs: 'true'
+            }
+        }
+
+        stage('Promote Runtime Image') {
+            steps {
+                script {
+                    openshift.withCluster() {
+                         openshift.tag("my-image:latest", testNamespace + "/my-image:${projectVersion}.${BUILD_ID}")
+                         openshift.tag(testNamespace + "/my-image:${projectVersion}.${BUILD_ID}", testNamespace + "/my-image:latest")
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts "Build-${env.BUILD_ID}-Unit-Test-Output.txt"
+        }
+    }
+}
+

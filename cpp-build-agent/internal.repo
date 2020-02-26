@@ -1,0 +1,5 @@
+[internal]
+name=Internal RPMs needed for builds
+baseurl=https://my-nexus-instance-url.com/repository/internal/
+enabled=0
+gpgcheck=0
